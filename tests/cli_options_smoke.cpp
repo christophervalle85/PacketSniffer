@@ -1,25 +1,28 @@
-// CLI argument parsing tests; these do not open an interface or capture traffic.
+// CLI parsing tests that never open an interface or require sudo.
+#include "CliOptions.hpp"
+
 #include <cassert>
 #include <initializer_list>
+#include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
-#define main packetsniffer_application_main
-#include "../packetSniffer.cpp"
-#undef main
+using packetsniffer::Options;
+using packetsniffer::ParseResult;
 
 namespace {
 
-ParseResult parse(std::initializer_list<std::string> arguments, Options& options) {
-    std::vector<std::string> strings(arguments);
+ParseResult parse(std::initializer_list<std::string> args, Options& options) {
+    std::vector<std::string> strings(args);
     std::vector<char*> argv;
-    for (auto& argument : strings) {
-        argv.push_back(argument.data());
-    }
-    return parse_arguments(static_cast<int>(argv.size()), argv.data(), options);
+    for (auto& arg : strings) argv.push_back(arg.data());
+    std::ostringstream expected_errors;
+    return packetsniffer::parse_arguments(
+        static_cast<int>(argv.size()), argv.data(), options, expected_errors);
 }
 
-}  // namespace
+} // namespace
 
 int main() {
     Options options;
@@ -39,7 +42,6 @@ int main() {
 
     options = {};
     assert(parse({"packetSniffer", "--help"}, options) == ParseResult::help);
-
     options = {};
     assert(parse({"packetSniffer"}, options) == ParseResult::error);
     options = {};
@@ -58,6 +60,5 @@ int main() {
     assert(parse({"packetSniffer", "lo0", "--no-such-option"}, options) == ParseResult::error);
     options = {};
     assert(parse({"packetSniffer", "-i", "lo0", "en0"}, options) == ParseResult::error);
-
     std::cout << "CLI parsing smoke tests passed.\n";
 }

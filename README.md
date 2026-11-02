@@ -1,126 +1,103 @@
 # PacketSniffer
 
-A small C++ packet sniffer built with **libpcap** to learn how network captures and TCP/IP headers work. It is intended for traffic I own or am explicitly authorized to inspect, including loopback experiments on my own computer.
+A C++ network packet analyzer built with **libpcap** to explore TCP/IP headers, defensive packet parsing, and authorized traffic inspection. I use it for traffic I own or am explicitly permitted to monitor, including localhost experiments.
 
-## What it does
+## Features
 
-- Captures packets from a network interface selected on the command line.
-- Detects the link-layer type at runtime instead of assuming macOS and Linux use different packet layouts.
-- Supports Ethernet (including VLAN tags), BSD/macOS loopback, raw IP, and Linux cooked capture headers where available.
-- Displays Ethernet MAC addresses, IPv4 source/destination addresses, and TCP source/destination ports when those headers are present and valid.
-- Shows packet headers and capture lengths by default; optional hexadecimal/ASCII output is limited to **captured bytes only**.
-- Supports BPF capture filters, bounded capture counts, and a built-in `--help` command.
-- Stops with Ctrl-C and closes the capture handle.
+- Capture traffic from a selected network interface, with promiscuous mode disabled.
+- Apply libpcap/BPF filters, such as **tcp port 8765**.
+- Stop after a specified number of matching packets, or press Ctrl-C.
+- Decode Ethernet (including VLAN tags), macOS/BSD loopback, raw IP, and Linux cooked link-layer formats where supported.
+- Display IPv4 addresses, TCP port numbers, captured lengths, and optional hexadecimal/ASCII dumps.
+- Validate captured lengths before reading packet headers.
 
-Promiscuous mode is **disabled**. The sniffer does not send packets or attempt to decrypt encrypted traffic.
+## Phase 2 architecture
+
+The former single-file implementation is separated into components with one responsibility each:
+
+| Component | Responsibility |
+| --- | --- |
+| src/main.cpp | Coordinates arguments and application startup |
+| src/CliOptions.cpp | Validates CLI arguments |
+| src/PacketCapture.cpp | Manages libpcap handles, BPF filters, callbacks, and cleanup |
+| src/PacketParser.cpp | Decodes captured bytes without any network I/O |
+| src/PacketFormatter.cpp | Prints readable packet summaries and optional hex dumps |
+
+Public interfaces are declared in **include/**. Capture handles and interface lists use RAII to release resources automatically. The parser and formatter are testable with synthetic buffers without capturing live traffic.
 
 ## Requirements
 
 - macOS or Linux
-- A C++17 compiler
-- The libpcap headers and library
-  - macOS: libpcap is usually available with the system developer tools; install Xcode Command Line Tools if needed.
-  - Debian/Ubuntu: install g++ and libpcap-dev (for example, **sudo apt install g++ libpcap-dev**).
-- Permission to capture on the selected interface (often requires sudo).
+- CMake 3.16+, a C++17 compiler, and libpcap headers/library
+- Permission to capture on the selected interface (often sudo)
 
-## Build
+On Debian/Ubuntu, install **cmake**, **g++**, and **libpcap-dev**. On macOS, install CMake if needed and use the system C++ compiler and libpcap development headers.
 
-From the repository directory:
+## Build and run tests locally
+
+From the repository root:
 
 ~~~bash
-g++ -std=c++17 -Wall -Wextra -Wpedantic -o packetSniffer packetSniffer.cpp -lpcap
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure
+~~~
+
+There are no GitHub Actions workflows. The local tests use synthetic packets and CLI arguments, not real network interfaces, and do not require sudo.
+
+Show the built-in help:
+
+~~~bash
+./build/packetSniffer --help
 ~~~
 
 ## Command-line options
 
 ~~~text
-Usage: ./packetSniffer [options] <network-interface>
-       ./packetSniffer -i <network-interface> [options]
+Usage: ./build/packetSniffer [options] <network-interface>
+       ./build/packetSniffer -i <network-interface> [options]
 
-  -i, --interface <name>  Choose an interface (lo0 on macOS, lo on Linux)
-  -f, --filter <expr>     Capture only packets matching a BPF filter
+  -i, --interface <name>  Network interface (e.g. lo0 on macOS)
+  -f, --filter <expr>     BPF filter (e.g. 'tcp port 8765')
   -c, --count <number>   Stop after this many matching packets
-  -x, --hex              Show the hex/ASCII captured-byte dump
-  -h, --help             Print usage without opening an interface
+  -x, --hex              Print packet bytes in hex and ASCII
+  -h, --help             Show this help message
 ~~~
 
-The original interface argument still works: `sudo ./packetSniffer lo0`. By default the sniffer prints headers without hex/ASCII dumps, and runs until Ctrl-C.
-
-To monitor only traffic for the local HTTP server on port 8765, and stop after ten matching packets:
-
-~~~bash
-sudo ./packetSniffer lo0 --filter "tcp port 8765" --count 10
-~~~
-
-Use `--hex` only if you intentionally need to inspect captured bytes. They may contain plaintext sensitive information, so avoid full dumps when they're not needed.
-
-An invalid filter is reported and the capture exits; filters use standard libpcap/BPF expression syntax. Capture counts apply to packets **after filtering**.
+The original positional interface syntax still works.
 
 ## Safe localhost test
 
-Only capture traffic you own or have permission to monitor. To test without capturing other devices' traffic, use the **loopback** interface and generate the requests yourself.
+Run only on interfaces you are authorized to monitor. On macOS, use loopback **lo0** (Linux: **lo**) to keep traffic on your machine.
 
-1. Start the sniffer in one terminal:
-
-   **macOS:**
-   ~~~bash
-   sudo ./packetSniffer lo0 --filter "tcp port 8765" --count 20
-   ~~~
-
-   **Linux:**
-   ~~~bash
-   sudo ./packetSniffer lo --filter "tcp port 8765" --count 20
-   ~~~
-
-2. Start a local HTTP server in a second terminal (in a directory with no private files):
-
-   ~~~bash
-   mkdir -p /tmp/packetsniffer-lab
-   cd /tmp/packetsniffer-lab
-   python3 -m http.server 8765 --bind 127.0.0.1
-   ~~~
-
-3. Generate your own traffic in a third terminal:
-
-   ~~~bash
-   curl http://127.0.0.1:8765/
-   ~~~
-
-4. Inspect the captured IPv4/TCP headers. The sniffer stops after 20 matching packets; otherwise, press **Ctrl-C**. Press Ctrl-C separately to stop the Python server.
-
-**Privacy note:** Packet dumps can expose plaintext data. Use synthetic/local test traffic, do not capture other people's private communications, and do not upload real captures containing sensitive information.
-
-## Parsing safeguards
-
-The capture callback receives both the original wire length (**len**) and the number of bytes actually available (**caplen**). Every header access uses **caplen**, validates the link-layer offset, and checks the declared IPv4 and TCP header sizes. Invalid, truncated, and fragmented packets are reported or skipped without trying to read an absent transport header.
-
-## Current limitations
-
-- IPv4 parsing only; IPv6 packets are skipped.
-- TCP port decoding only; other IPv4 protocols are identified by number but not decoded.
-- Fragmented IPv4 traffic is not reassembled.
-- Link-layer support is limited to the types listed above; unsupported capture types produce an error.
-- Output is written to the terminal; there is no offline PCAP reader or GUI yet.
-- Local tests are available, but no GitHub Actions workflow is configured.
-
-## Run tests locally (no GitHub Actions)
-
-Compile and run the synthetic packet safety tests:
+Terminal 1:
 
 ~~~bash
-g++ -std=c++17 -Wall -Wextra -Wpedantic -o phase1_safety_smoke tests/phase1_safety_smoke.cpp -lpcap
-./phase1_safety_smoke
+sudo ./build/packetSniffer lo0 --filter "tcp port 8765" --count 10
 ~~~
 
-Compile and run CLI parser tests:
+Terminal 2:
 
 ~~~bash
-g++ -std=c++17 -Wall -Wextra -Wpedantic -o cli_options_smoke tests/cli_options_smoke.cpp -lpcap
-./cli_options_smoke
+mkdir -p /tmp/packetsniffer-lab
+cd /tmp/packetsniffer-lab
+python3 -m http.server 8765 --bind 127.0.0.1
 ~~~
 
-These tests don't open a live network interface, so no sudo is required. They verify specific parser and CLI behaviors, not all possible traffic or macOS versions.
+Terminal 3:
 
-## Development plan
+~~~bash
+curl http://127.0.0.1:8765/
+~~~
 
-Phase 1 fixes input validation, capture-handle usage, packet bounds checks, link-layer detection, and cleanup. The next phases will separate capture/parsing/output, add offline fixtures and broader tests, and support more protocols. BPF filters, packet limits, and optional hex output were brought forward after live testing showed how noisy unfiltered captures can be.
+Repeat curl if the sniffer has not yet received ten packets. Look for IPv4 addresses **127.0.0.1** and TCP port **8765**. The sniffer stops at the count; Ctrl-C also stops it.
+
+The optional **--hex** flag prints captured bytes, which may include plaintext private information. Avoid using it unless needed, and do not upload private real-world captures.
+
+## Limitations and next steps
+
+- IPv4 and TCP header decoding only; other protocols, including IPv6, are not decoded.
+- Fragmented IPv4 datagrams are not reassembled.
+- No offline PCAP reader or GUI.
+- Supported link-layer formats are detected at runtime.
+- Phase 1 fixed capture safety; Phase 2 separated code responsibilities and added CMake and local regression tests. Next: more offline fixtures, protocol support, and additional testing.
