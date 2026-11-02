@@ -5,6 +5,10 @@
 #include <netinet/in.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <climits>
+#include <cstdlib>
+#include <string>
 #include <cctype>
 #include <csignal>
 #include <cstddef>
@@ -22,7 +26,96 @@ constexpr int SNAP_LENGTH = 65535;
 
 struct CaptureContext {
     int data_link_type;
+    bool show_hex = false;
 };
+
+struct Options {
+    std::string device;
+    std::string filter;
+    int count = 0;               // 0 means capture until interrupted.
+    bool show_hex = false;
+};
+
+enum class ParseResult { ok, help, error };
+
+void print_usage(const char* program, std::ostream& out) {
+    out << "Usage: " << program << " [options] <network-interface>\n"
+        << "       " << program << " -i <network-interface> [options]\n\n"
+        << "Options:\n"
+        << "  -i, --interface <name>  Network interface (e.g. lo0 on macOS)\n"
+        << "  -f, --filter <expr>     BPF filter (e.g. 'tcp port 8765')\n"
+        << "  -c, --count <number>   Stop after this many matching packets\n"
+        << "  -x, --hex              Print packet bytes in hex and ASCII\n"
+        << "  -h, --help             Show this help message\n"
+        << "\nUse only network interfaces you're authorized to monitor.\n";
+}
+
+bool parse_positive_count(const char* value, int& result) {
+    if (value == nullptr || *value == '\0') return false;
+    errno = 0;
+    char* end = nullptr;
+    const long count = std::strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' ||
+        count <= 0 || count > INT_MAX) {
+        return false;
+    }
+    result = static_cast<int>(count);
+    return true;
+}
+
+ParseResult parse_arguments(int argc, char* argv[], Options& options) {
+    for (int i = 1; i < argc; ++i) {
+        const std::string argument = argv[i];
+        if (argument == "-h" || argument == "--help") {
+            return ParseResult::help;
+        }
+        if (argument == "-x" || argument == "--hex") {
+            options.show_hex = true;
+            continue;
+        }
+        if (argument == "-i" || argument == "--interface") {
+            if (!options.device.empty() || i + 1 >= argc ||
+                argv[i + 1][0] == '\0' || argv[i + 1][0] == '-') {
+                std::cerr << "Invalid or duplicate interface argument.\n";
+                return ParseResult::error;
+            }
+            options.device = argv[++i];
+            continue;
+        }
+        if (argument == "-f" || argument == "--filter") {
+            if (!options.filter.empty() || i + 1 >= argc ||
+                argv[i + 1][0] == '\0') {
+                std::cerr << "Missing or duplicate packet filter.\n";
+                return ParseResult::error;
+            }
+            options.filter = argv[++i];
+            continue;
+        }
+        if (argument == "-c" || argument == "--count") {
+            if (options.count != 0 || i + 1 >= argc ||
+                !parse_positive_count(argv[i + 1], options.count)) {
+                std::cerr << "Packet count must be a positive integer.\n";
+                return ParseResult::error;
+            }
+            ++i;
+            continue;
+        }
+        if (!argument.empty() && argument[0] == '-') {
+            std::cerr << "Unknown option: " << argument << '\n';
+            return ParseResult::error;
+        }
+        if (!options.device.empty()) {
+            std::cerr << "Only one interface can be specified.\n";
+            return ParseResult::error;
+        }
+        options.device = argument;  // Preserve ./packetSniffer lo0 syntax.
+    }
+    if (options.device.empty()) {
+        std::cerr << "A network interface is required.\n";
+        return ParseResult::error;
+    }
+    return ParseResult::ok;
+}
 
 // pcap_breakloop() can be called from a signal handler on supported Unix systems.
 pcap_t* volatile active_capture = nullptr;
@@ -278,7 +371,9 @@ void packet_handler(unsigned char* user_data, const pcap_pkthdr* header,
     if (get_ipv4_offset(context->data_link_type, packet, captured_length, ip_offset)) {
         print_ipv4_and_tcp(packet, captured_length, ip_offset);
     }
-    print_packet_bytes(packet, captured_length);
+    if (context->show_hex) {
+        print_packet_bytes(packet, captured_length);
+    }
     std::cout << "------------------- Packet End -------------------\n";
 }
 
@@ -305,20 +400,26 @@ void print_interface_address(const char* device) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
-    if (argc != 2) {
-        std::cerr << "Usage: " << argv[0] << " <network-interface>\n"
-                  << "For a local test, use lo0 on macOS or lo on Linux.\n";
+    Options options;
+    const ParseResult parsed = parse_arguments(argc, argv, options);
+    if (parsed == ParseResult::help) {
+        print_usage(argv[0], std::cout);
+        return 0;
+    }
+    if (parsed == ParseResult::error) {
+        print_usage(argv[0], std::cerr);
         return 1;
     }
 
-    const char* device = argv[1];
-    print_interface_address(device);
+    print_interface_address(options.device.c_str());
 
     char error_buffer[PCAP_ERRBUF_SIZE] = {};
-    // Capture traffic on the selected interface without promiscuous mode.
-    pcap_t* handle = pcap_open_live(device, SNAP_LENGTH, 0, 1000, error_buffer);
+    // Promiscuous mode is off; the selected interface is the only capture source.
+    pcap_t* handle = pcap_open_live(options.device.c_str(), SNAP_LENGTH, 0,
+                                    1000, error_buffer);
     if (handle == nullptr) {
-        std::cerr << "Could not open interface '" << device << "': " << error_buffer << '\n';
+        std::cerr << "Could not open interface '" << options.device
+                  << "': " << error_buffer << '\n';
         return 1;
     }
 
@@ -330,17 +431,43 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    const char* link_type_name = pcap_datalink_val_to_name(data_link_type);
-    std::cout << "Capturing on " << device << " ("
-              << (link_type_name != nullptr ? link_type_name : "unknown")
-              << "), promiscuous mode off. Press Ctrl-C to stop.\n";
+    if (!options.filter.empty()) {
+        bpf_program compiled_filter{};
+        if (pcap_compile(handle, &compiled_filter, options.filter.c_str(),
+                         1, PCAP_NETMASK_UNKNOWN) == PCAP_ERROR) {
+            std::cerr << "Invalid capture filter: " << pcap_geterr(handle) << '\n';
+            pcap_close(handle);
+            return 1;
+        }
+        const int filter_result = pcap_setfilter(handle, &compiled_filter);
+        pcap_freecode(&compiled_filter);
+        if (filter_result == PCAP_ERROR) {
+            std::cerr << "Could not apply capture filter: " << pcap_geterr(handle) << '\n';
+            pcap_close(handle);
+            return 1;
+        }
+    }
 
-    const CaptureContext context{data_link_type};
+    const char* link_type_name = pcap_datalink_val_to_name(data_link_type);
+    std::cout << "Capturing on " << options.device << " ("
+              << (link_type_name != nullptr ? link_type_name : "unknown")
+              << "), promiscuous mode off.\n";
+    if (!options.filter.empty()) {
+        std::cout << "Filter: " << options.filter << '\n';
+    }
+    if (options.count > 0) {
+        std::cout << "Packet limit: " << options.count << '\n';
+    } else {
+        std::cout << "Press Ctrl-C to stop.\n";
+    }
+    std::cout << "Packet hex/ASCII dump: "
+              << (options.show_hex ? "enabled" : "disabled (use --hex)") << '\n';
+
+    CaptureContext context{data_link_type, options.show_hex};
     active_capture = handle;
     const auto previous_signal_handler = std::signal(SIGINT, stop_capture);
-    const int result = pcap_loop(handle, 0, packet_handler,
-                                 reinterpret_cast<unsigned char*>(
-                                     const_cast<CaptureContext*>(&context)));
+    const int result = pcap_loop(handle, options.count, packet_handler,
+                                 reinterpret_cast<unsigned char*>(&context));
     active_capture = nullptr;
     std::signal(SIGINT, previous_signal_handler);
 
