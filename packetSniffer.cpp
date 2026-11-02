@@ -1,214 +1,352 @@
-#include <iostream>
 #include <pcap.h>
-#include <ifaddrs.h>
+
 #include <arpa/inet.h>
+#include <ifaddrs.h>
 #include <netinet/in.h>
-#include <netinet/ip.h>
-#include <netinet/tcp.h>
+
+#include <algorithm>
+#include <cctype>
+#include <csignal>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
-#include <limits>
+#include <iomanip>
+#include <iostream>
 
-/* check if code is being compiled in macOS, if so define the MACOS macro for platform-specific operations */
-#ifdef __APPLE__
-#define MACOS
-#endif
+namespace {
 
-/* 
- * create the packet_handler function that handles all the data
- * parses the packet headers, extracts source and destination information, 
- * and prints hexadecimal and ASCII representations of the packet data.
- */
-void packet_handler(unsigned char* user_data, const struct pcap_pkthdr* pkthdr, const unsigned char* packet_data) {
-    /* lets the user know where the start of a packet is located */
-    std::cout << "----------------- Packet Data Captured -----------------" << std::endl;
-    /* lets the user know the length of the packet */
-    std::cout << "Captured Packet Length: " << pkthdr->len << " bytes." << std::endl;
+constexpr std::size_t ETHERNET_HEADER_LENGTH = 14;
+constexpr std::size_t IPV4_MIN_HEADER_LENGTH = 20;
+constexpr std::size_t TCP_MIN_HEADER_LENGTH = 20;
+constexpr int SNAP_LENGTH = 65535;
 
-    #ifdef MACOS
-    /*
-     * on macOS, Ethernet headers are not available, so we skip Ethernet parsing
-     * check if it's an IP packet
-     */
+struct CaptureContext {
+    int data_link_type;
+};
 
-    if (pkthdr->len >= sizeof(struct ip)) {
-        struct ip* ip_header = (struct ip*)packet_data;
-        std::cout << "Source IP: " << inet_ntoa(ip_header->ip_src) << std::endl;
-        std::cout << "Destination IP: " << inet_ntoa(ip_header->ip_dst) << std::endl;
+// pcap_breakloop() can be called from a signal handler on supported Unix systems.
+pcap_t* volatile active_capture = nullptr;
 
-        /* check if it's a TCP packet */
-        if (ip_header->ip_p == IPPROTO_TCP && pkthdr->len >= (sizeof(struct ip) + sizeof(struct tcphdr))) {
-            struct tcphdr* tcp_header = (struct tcphdr*)(packet_data + ip_header->ip_hl * 4); // Skip IP header
-            std::cout << "Source Port: " << ntohs(tcp_header->th_sport) << std::endl;
-            std::cout << "Destination Port: " << ntohs(tcp_header->th_dport) << std::endl;
-        }
+void stop_capture(int) {
+    if (active_capture != nullptr) {
+        pcap_breakloop(active_capture);
     }
-/* 
- * condition ran if the #ifdef statement is false
- * code below is meant for Linux 
- */
-#else
-    /*
-     * Linux can parse Ethernet headers
-     * check if it's an Ethernet (DLT_EN10MB) packet
-     */
-    int data_link_type = pcap_datalink(nullptr);
-    if (data_link_type == DLT_EN10MB) {
-
-        /* check if the packet is large enough to contain an Ethernet header */
-        if (pkthdr->len >= sizeof(struct ether_header)) {
-
-            /* parse Ethernet header */
-            struct ether_header* eth_header = (struct ether_header*)packet_data;
-            std::cout << "Source MAC: ";
-            for (int i = 0; i < 6; ++i) {
-                printf("%02x", eth_header->ether_shost[i]);
-                if (i < 5) {
-                    std::cout << ":";
-                }
-            }
-            std::cout << std::endl;
-            std::cout << "Destination MAC: ";
-            for (int i = 0; i < 6; ++i) {
-                printf("%02x", eth_header->ether_dhost[i]);
-                if (i < 5) {
-                    std::cout << ":";
-                }
-            }
-            std::cout << std::endl;
-        }
-    }
-    
-    /* check if it's an IP packet */
-    if (pkthdr->len >= sizeof(struct ip)) {
-        struct ip* ip_header = (struct ip*)(packet_data + sizeof(struct ether_header)); // Skip Ethernet header
-        std::cout << "Source IP: " << inet_ntoa(ip_header->ip_src) << std::endl;
-        std::cout << "Destination IP: " << inet_ntoa(ip_header->ip_dst) << std::endl;
-
-        /* check if it's a TCP packet */
-        if (ip_header->ip_p == IPPROTO_TCP && pkthdr->len >= (sizeof(struct ether_header) + sizeof(struct ip) + sizeof(struct tcphdr))) {
-            struct tcphdr* tcp_header = (struct tcphdr*)(packet_data + sizeof(struct ether_header) + ip_header->ip_hl * 4); // Skip IP header
-            std::cout << "Source Port: " << ntohs(tcp_header->th_sport) << std::endl;
-            std::cout << "Destination Port: " << ntohs(tcp_header->th_dport) << std::endl;
-        }
-    }
-#endif
-
-    /* print packet data (hexadecimal representation) */
-    std::cout << "Packet data (hex): \n";
-    for (int i = 0; i < pkthdr->len; ++i) {
-        printf("%02x ", packet_data[i]);
-        if (i % 8 == 0) printf("\n");
-    }
-    std::cout << std::endl;
-
-    /* print packet data (ASCII representation) */
-    std::cout << "Packet data (ASCII): \n";
-    for (int i = 0; i < pkthdr->len; ++i) {
-        char c = packet_data[i];
-        if (isprint(c)) {
-            std::cout << c;
-        } 
-        else {
-            std::cout << ".";
-        }
-    }
-    std::cout << std::endl;
-        std::cout << "------------------- Packet End -------------------" << std::endl;
 }
 
-int main(int argc, char* argv[]) {
+std::uint16_t read_be16(const unsigned char* data) {
+    return static_cast<std::uint16_t>((static_cast<std::uint16_t>(data[0]) << 8) | data[1]);
+}
 
-    
-    char* dev;
+std::uint32_t read_be32(const unsigned char* data) {
+    return (static_cast<std::uint32_t>(data[0]) << 24) |
+           (static_cast<std::uint32_t>(data[1]) << 16) |
+           (static_cast<std::uint32_t>(data[2]) << 8) |
+           static_cast<std::uint32_t>(data[3]);
+}
 
-    /* check if there are at least two arguments (program name and one additional argument) */
-    if (argc >= 2) {
-        /* 
-         * we will access command line arguments below using the
-         * argv array which holds argument separated by spaces 
-         */
-        std::cout << "Program name : " << argv[0] << std::endl;
-        std::cout << "Device Name  : " << argv[1] << std::endl;
-        
-        /* we assign the device name to the device variable */
-        dev = argv[1];
+void print_mac(const unsigned char* mac) {
+    const auto previous_flags = std::cout.flags();
+    const auto previous_fill = std::cout.fill();
+    for (std::size_t i = 0; i < 6; ++i) {
+        if (i != 0) std::cout << ':';
+        std::cout << std::hex << std::setfill('0') << std::setw(2)
+                  << static_cast<unsigned int>(mac[i]);
+    }
+    std::cout.flags(previous_flags);
+    std::cout.fill(previous_fill);
+}
 
-        struct ifaddrs* ifap;
-        struct sockaddr_in* addr;
+bool supported_link_type(int data_link_type) {
+    switch (data_link_type) {
+        case DLT_EN10MB:
+        case DLT_NULL:
+        case DLT_LOOP:
+        case DLT_RAW:
+#ifdef DLT_LINUX_SLL
+        case DLT_LINUX_SLL:
+#endif
+#ifdef DLT_LINUX_SLL2
+        case DLT_LINUX_SLL2:
+#endif
+            return true;
+        default:
+            return false;
+    }
+}
 
-        /* 
-         * below we are checking that we can acquire our local IP
-         * address and if we are successful we print it so we can 
-         * compare across packets if needed.
-         */
-        if (getifaddrs(&ifap) == 0) {
-            for (struct ifaddrs* ifa = ifap; ifa != nullptr; ifa = ifa->ifa_next) {
-                if (ifa->ifa_addr != nullptr && ifa->ifa_addr->sa_family == AF_INET) {
-                    addr = (struct sockaddr_in*)ifa->ifa_addr;
-
-                    /* 
-                     * ese "en0" for Ethernet/Wi-Fi interface 
-                     * note: this is assigned by argv[1] 
-                     */
-                    if (strcmp(ifa->ifa_name, dev) == 0) {
-                        std::cout << "Your IP address on " << ifa->ifa_name << ": " << inet_ntoa(addr->sin_addr) << std::endl;
-                    }
-                }
+// Only return an IPv4 offset when the complete link-layer header is captured.
+bool get_ipv4_offset(int data_link_type, const unsigned char* packet,
+                     std::size_t captured_length, std::size_t& ip_offset) {
+    ip_offset = 0;
+    switch (data_link_type) {
+        case DLT_EN10MB: {
+            if (captured_length < ETHERNET_HEADER_LENGTH) {
+                std::cout << "Truncated Ethernet header.\n";
+                return false;
             }
+            std::cout << "Source MAC: ";
+            print_mac(packet + 6);
+            std::cout << "\nDestination MAC: ";
+            print_mac(packet);
+            std::cout << '\n';
 
-            /* Free the memory allocated by getifaddrs */
-            freeifaddrs(ifap); 
-        } 
-        
-        else {
-            std::cerr << "Failed to get IP address." << std::endl;
+            std::uint16_t ether_type = read_be16(packet + 12);
+            ip_offset = ETHERNET_HEADER_LENGTH;
+            // An Ethernet frame may have one or more 802.1Q/802.1ad VLAN tags.
+            while (ether_type == 0x8100 || ether_type == 0x88a8 || ether_type == 0x9100) {
+                if (captured_length - ip_offset < 4) {
+                    std::cout << "Truncated VLAN header.\n";
+                    return false;
+                }
+                ether_type = read_be16(packet + ip_offset + 2);
+                ip_offset += 4;
+            }
+            if (ether_type != 0x0800) {
+                std::cout << "Skipping non-IPv4 Ethernet frame.\n";
+                return false;
+            }
+            return true;
         }
+        case DLT_NULL:
+        case DLT_LOOP: {
+            if (captured_length < 4) {
+                std::cout << "Truncated loopback header.\n";
+                return false;
+            }
+            std::uint32_t family = 0;
+            if (data_link_type == DLT_NULL) {
+                // DLT_NULL stores the address family in host byte order.
+                std::memcpy(&family, packet, sizeof(family));
+            } else {
+                // DLT_LOOP stores the address family in network byte order.
+                family = read_be32(packet);
+            }
+            if (family != AF_INET) {
+                std::cout << "Skipping non-IPv4 loopback packet.\n";
+                return false;
+            }
+            ip_offset = 4;
+            return true;
+        }
+        case DLT_RAW:
+            return true;
+#ifdef DLT_LINUX_SLL
+        case DLT_LINUX_SLL:
+            if (captured_length < 16) {
+                std::cout << "Truncated Linux cooked header.\n";
+                return false;
+            }
+            if (read_be16(packet + 14) != 0x0800) {
+                std::cout << "Skipping non-IPv4 cooked packet.\n";
+                return false;
+            }
+            ip_offset = 16;
+            return true;
+#endif
+#ifdef DLT_LINUX_SLL2
+        case DLT_LINUX_SLL2:
+            if (captured_length < 20) {
+                std::cout << "Truncated Linux cooked v2 header.\n";
+                return false;
+            }
+            if (read_be16(packet) != 0x0800) {
+                std::cout << "Skipping non-IPv4 cooked packet.\n";
+                return false;
+            }
+            ip_offset = 20;
+            return true;
+#endif
+        default:
+            std::cout << "Unsupported data link type: " << data_link_type << '\n';
+            return false;
+    }
+}
 
-    } else {
-
-        std::cout << "No additional command-line arguments provided." << std::endl;
+void print_ipv4_and_tcp(const unsigned char* packet, std::size_t captured_length,
+                        std::size_t ip_offset) {
+    if (ip_offset > captured_length ||
+        captured_length - ip_offset < IPV4_MIN_HEADER_LENGTH) {
+        std::cout << "Truncated IPv4 header.\n";
+        return;
     }
 
-    /* create an error buffer to store any errors that may be thrown and set the buffer to max size */
-    char errbuf[PCAP_ERRBUF_SIZE];
-    pcap_t* handle;
+    const unsigned char* ip = packet + ip_offset;
+    const std::size_t available = captured_length - ip_offset;
+    const unsigned int version = ip[0] >> 4;
+    const std::size_t ip_header_length = static_cast<std::size_t>(ip[0] & 0x0f) * 4;
+    if (version != 4 || ip_header_length < IPV4_MIN_HEADER_LENGTH) {
+        std::cout << "Invalid or unsupported IPv4 header.\n";
+        return;
+    }
+    if (available < ip_header_length) {
+        std::cout << "Truncated IPv4 options/header.\n";
+        return;
+    }
 
-    /* 
-     * find all available network devices 
-     * note: we do not use the alldevs in this
-     * program, and is only here for reference.
-     * alldevs contains all devices on the system
-     * and can access each by walking the list
-     */
-    pcap_if_t* alldevs;
-    if (pcap_findalldevs(&alldevs, errbuf) == -1) {
-        std::cerr << "Error finding network devices: " << errbuf << std::endl;
+    const std::size_t ip_total_length = read_be16(ip + 2);
+    if (ip_total_length < ip_header_length) {
+        std::cout << "Invalid IPv4 total length.\n";
+        return;
+    }
+
+    char source_ip[INET_ADDRSTRLEN] = {};
+    char destination_ip[INET_ADDRSTRLEN] = {};
+    if (inet_ntop(AF_INET, ip + 12, source_ip, sizeof(source_ip)) == nullptr ||
+        inet_ntop(AF_INET, ip + 16, destination_ip, sizeof(destination_ip)) == nullptr) {
+        std::cout << "Failed to format IPv4 addresses.\n";
+        return;
+    }
+    std::cout << "Source IP: " << source_ip << '\n';
+    std::cout << "Destination IP: " << destination_ip << '\n';
+    std::cout << "IP protocol: " << static_cast<unsigned int>(ip[9]) << '\n';
+
+    if (available < ip_total_length) {
+        std::cout << "Note: IPv4 packet is truncated in this capture.\n";
+    }
+
+    // Fragmented datagrams require reassembly before safe transport parsing.
+    if ((read_be16(ip + 6) & 0x3fff) != 0) {
+        std::cout << "Fragmented IPv4 packet; skipping transport header.\n";
+        return;
+    }
+    if (ip[9] != IPPROTO_TCP) {
+        return;
+    }
+
+    const std::size_t ip_payload_length = ip_total_length - ip_header_length;
+    const std::size_t captured_payload_length =
+        std::min(available, ip_total_length) - ip_header_length;
+    if (ip_payload_length < TCP_MIN_HEADER_LENGTH) {
+        std::cout << "Invalid TCP length in IPv4 packet.\n";
+        return;
+    }
+    if (captured_payload_length < TCP_MIN_HEADER_LENGTH) {
+        std::cout << "Truncated TCP header.\n";
+        return;
+    }
+
+    const unsigned char* tcp = ip + ip_header_length;
+    const std::size_t tcp_header_length = static_cast<std::size_t>(tcp[12] >> 4) * 4;
+    if (tcp_header_length < TCP_MIN_HEADER_LENGTH ||
+        tcp_header_length > ip_payload_length) {
+        std::cout << "Invalid TCP data offset.\n";
+        return;
+    }
+    if (tcp_header_length > captured_payload_length) {
+        std::cout << "Truncated TCP options/header.\n";
+        return;
+    }
+    std::cout << "Source Port: " << read_be16(tcp) << '\n';
+    std::cout << "Destination Port: " << read_be16(tcp + 2) << '\n';
+}
+
+void print_packet_bytes(const unsigned char* packet, std::size_t captured_length) {
+    const auto previous_flags = std::cout.flags();
+    const auto previous_fill = std::cout.fill();
+    std::cout << "Packet bytes (hex and ASCII, captured bytes only):\n";
+    for (std::size_t offset = 0; offset < captured_length; offset += 16) {
+        std::cout << std::hex << std::setfill('0') << std::setw(4) << offset << "  ";
+        for (std::size_t j = 0; j < 16; ++j) {
+            if (offset + j < captured_length) {
+                std::cout << std::setw(2) << static_cast<unsigned int>(packet[offset + j])
+                          << ' ';
+            } else {
+                std::cout << "   ";
+            }
+        }
+        std::cout << " |";
+        for (std::size_t j = 0; j < 16 && offset + j < captured_length; ++j) {
+            const unsigned char byte = packet[offset + j];
+            std::cout << (std::isprint(byte) ? static_cast<char>(byte) : '.');
+        }
+        std::cout << "|\n";
+    }
+    std::cout.flags(previous_flags);
+    std::cout.fill(previous_fill);
+}
+
+void packet_handler(unsigned char* user_data, const pcap_pkthdr* header,
+                    const unsigned char* packet) {
+    if (user_data == nullptr || header == nullptr || packet == nullptr) return;
+    const auto* context = reinterpret_cast<const CaptureContext*>(user_data);
+    const std::size_t captured_length = header->caplen;
+
+    std::cout << "\n----------------- Packet Captured -----------------\n";
+    std::cout << "Original length: " << header->len << " bytes\n";
+    std::cout << "Captured length: " << captured_length << " bytes\n";
+    std::size_t ip_offset = 0;
+    if (get_ipv4_offset(context->data_link_type, packet, captured_length, ip_offset)) {
+        print_ipv4_and_tcp(packet, captured_length, ip_offset);
+    }
+    print_packet_bytes(packet, captured_length);
+    std::cout << "------------------- Packet End -------------------\n";
+}
+
+void print_interface_address(const char* device) {
+    ifaddrs* interfaces = nullptr;
+    if (getifaddrs(&interfaces) != 0) {
+        std::cerr << "Warning: could not list local interface addresses.\n";
+        return;
+    }
+    for (const ifaddrs* current = interfaces; current != nullptr; current = current->ifa_next) {
+        if (current->ifa_addr == nullptr || current->ifa_addr->sa_family != AF_INET ||
+            std::strcmp(current->ifa_name, device) != 0) {
+            continue;
+        }
+        const auto* ipv4 = reinterpret_cast<const sockaddr_in*>(current->ifa_addr);
+        char address[INET_ADDRSTRLEN] = {};
+        if (inet_ntop(AF_INET, &ipv4->sin_addr, address, sizeof(address)) != nullptr) {
+            std::cout << "Your IPv4 address on " << device << ": " << address << '\n';
+        }
+    }
+    freeifaddrs(interfaces);
+}
+
+}  // namespace
+
+int main(int argc, char* argv[]) {
+    if (argc != 2) {
+        std::cerr << "Usage: " << argv[0] << " <network-interface>\n"
+                  << "For a local test, use lo0 on macOS or lo on Linux.\n";
         return 1;
     }
 
-    /* sets the actual device that we are going to be listening to */
-    pcap_if_t* device;
-    int deviceCount = 0;
+    const char* device = argv[1];
+    print_interface_address(device);
 
-    /* specifies promiscuous mode - meaning all network traffic is captured (live listen) */
-    handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuf);
+    char error_buffer[PCAP_ERRBUF_SIZE] = {};
+    // Capture traffic on the selected interface without promiscuous mode.
+    pcap_t* handle = pcap_open_live(device, SNAP_LENGTH, 0, 1000, error_buffer);
     if (handle == nullptr) {
-        std::cerr << "Could not open device " << dev << ": " << errbuf << std::endl;
-        
-        /* free all devices in the list including that stored in dev */
-        pcap_freealldevs(alldevs);
+        std::cerr << "Could not open interface '" << device << "': " << error_buffer << '\n';
         return 1;
     }
 
-    /* start capturing packets and call the packet_handler function for each packet */ 
-    pcap_loop(handle, 0, packet_handler, nullptr);
+    const int data_link_type = pcap_datalink(handle);
+    if (!supported_link_type(data_link_type)) {
+        std::cerr << "Unsupported link-layer type " << data_link_type
+                  << ". Use an Ethernet, loopback, raw IP, or Linux cooked interface.\n";
+        pcap_close(handle);
+        return 1;
+    }
 
-    /* close the capture handle when done */ 
+    const char* link_type_name = pcap_datalink_val_to_name(data_link_type);
+    std::cout << "Capturing on " << device << " ("
+              << (link_type_name != nullptr ? link_type_name : "unknown")
+              << "), promiscuous mode off. Press Ctrl-C to stop.\n";
+
+    const CaptureContext context{data_link_type};
+    active_capture = handle;
+    const auto previous_signal_handler = std::signal(SIGINT, stop_capture);
+    const int result = pcap_loop(handle, 0, packet_handler,
+                                 reinterpret_cast<unsigned char*>(
+                                     const_cast<CaptureContext*>(&context)));
+    active_capture = nullptr;
+    std::signal(SIGINT, previous_signal_handler);
+
+    if (result == PCAP_ERROR) {
+        std::cerr << "Capture failed: " << pcap_geterr(handle) << '\n';
+    }
     pcap_close(handle);
-
-    /* free the device list */
-    pcap_freealldevs(alldevs);
-
-    return 0;
-
+    return result == PCAP_ERROR ? 1 : 0;
 }
