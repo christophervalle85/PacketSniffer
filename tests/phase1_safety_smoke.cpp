@@ -1,6 +1,7 @@
 // Small regression checks for Phase 1 packet parsing safety.
 // The real entry point is renamed so the callback can be tested with synthetic bytes.
 #include <cassert>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
