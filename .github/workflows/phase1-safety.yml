@@ -1,0 +1,33 @@
+name: Phase 1 safety checks
+
+on:
+  push:
+    branches:
+      - fix/phase-1-packet-safety
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libpcap headers
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+      - name: Compile the packet sniffer
+        run: g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -o packetSniffer packetSniffer.cpp -lpcap
+      - name: Check missing-interface handling
+        run: |
+          if ./packetSniffer >/tmp/packetsniffer-usage.txt 2>&1; then
+            echo "Expected the program to reject a missing interface"
+            exit 1
+          fi
+          grep -q 'Usage:' /tmp/packetsniffer-usage.txt
+      - name: Run synthetic packet checks with sanitizers
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror \
+            -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -g -o phase1_safety_smoke tests/phase1_safety_smoke.cpp -lpcap
+          ./phase1_safety_smoke
