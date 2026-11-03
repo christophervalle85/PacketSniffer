@@ -94,10 +94,37 @@ Repeat curl if the sniffer has not yet received ten packets. Look for IPv4 addre
 
 The optional **--hex** flag prints captured bytes, which may include plaintext private information. Avoid using it unless needed, and do not upload private real-world captures.
 
+## Phase 3: packet reliability tests
+
+This branch adds two regression suites beyond the original parser and CLI smoke tests:
+
+- **`parser_adversarial`**: tests every truncated prefix of a known valid packet, loopback byte-order variants, malformed header fields, VLANs, and 12,000 deterministic random byte sequences.
+- **`pcap_fixture_regressions`**: reads **`tests/fixtures/synthetic_mixed_traffic.pcap`** using `pcap_open_offline`, verifies expected protocol fields and error handling, and applies an offline BPF filter. The fixture contains only constructed test traffic.
+
+The standard local test command runs all four suites:
+
+~~~bash
+ctest --test-dir build --output-on-failure
+~~~
+
+To check for memory errors and undefined behavior locally, build with sanitizers:
+
+~~~bash
+cmake -S . -B build-sanitized -DPACKETSNIFFER_ENABLE_SANITIZERS=ON
+cmake --build build-sanitized
+ctest --test-dir build-sanitized --output-on-failure
+~~~
+
+These checks increase confidence in the tested paths but cannot establish that all possible malformed packets are safe. They do not start a live capture and do not require sudo. There is no GitHub Actions workflow.
+
+### Filtering vs. reconstructed data
+
+`--filter` selects packets using libpcap's BPF filter syntax (for example, `--filter "tcp port 8765"`). Normal output displays protocol metadata; `--hex` additionally prints captured bytes, potentially including plaintext payloads. **The sniffer does not currently extract payloads, reassemble TCP streams, or decrypt TLS.** Future reconstruction should be explicit and bounded, with tests for out-of-order segments, retransmissions, and missing data.
+
 ## Limitations and next steps
 
 - IPv4 and TCP header decoding only; other protocols, including IPv6, are not decoded.
 - Fragmented IPv4 datagrams are not reassembled.
 - No offline PCAP reader or GUI.
 - Supported link-layer formats are detected at runtime.
-- Phase 1 fixed capture safety; Phase 2 separated code responsibilities and added CMake and local regression tests. Next: more offline fixtures, protocol support, and additional testing.
+- Phase 1 fixed capture safety; Phase 2 separated code responsibilities and added CMake. Phase 3 adds offline PCAP fixtures, adversarial parser tests, and opt-in local sanitizer builds. Future work can add protocol decoding and optional bounded TCP reconstruction.
