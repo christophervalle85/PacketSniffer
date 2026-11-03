@@ -1,0 +1,7 @@
+# Generated binaries and local CMake build directories
+/build/
+/cmake-build-*/
+packetSniffer
+phase1_safety_smoke
+cli_options_smoke
+.DS_Store
