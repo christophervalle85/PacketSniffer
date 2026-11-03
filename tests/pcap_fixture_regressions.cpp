@@ -112,7 +112,7 @@ int main(int argc, char* argv[]) {
 
     std::size_t total = 0;
     std::size_t matching = 0;
-    const pcap_pkthdr* header = nullptr;
+    pcap_pkthdr* header = nullptr;
     const unsigned char* bytes = nullptr;
     int status = 0;
     while ((status = pcap_next_ex(capture.get(), &header, &bytes)) == 1) {
